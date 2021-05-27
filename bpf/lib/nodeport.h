@@ -1102,30 +1102,10 @@ static __always_inline bool snat_v4_needed(struct __ctx_buff *ctx, __be32 *addr,
 	struct endpoint_info *ep __maybe_unused;
 	void *data, *data_end;
 	struct iphdr *ip4;
-	struct ipv4_ct_tuple tuple __maybe_unused = {};
-	bool is_reply __maybe_unused = false;
+	struct remote_endpoint_info *info __maybe_unused;
 
 	if (!revalidate_data(ctx, &data, &data_end, &ip4))
 		return false;
-
-#if defined(ENABLE_EGRESS_GATEWAY)
-	/* Check if SNAT needs to be applied to the packet. Apply SNAT if there
-	 * is an egress rule in ebpf map, and the packet is not coming out from
-	 * overlay interface. If the packet is coming from an overlay interface
-	 * it means it is forwarded to another node, instead of leaving the
-	 * cluster.
-	 */
-	if (1) {
-		struct egress_info *info;
-
-		info = lookup_ip4_egress_endpoint(ip4->saddr, ip4->daddr);
-		if (info && ctx->ifindex != ENCAP_IFINDEX) {
-			*addr = info->egress_ip;
-			*from_endpoint = true;
-			return true;
-		}
-	}
-#endif
 
 	/* Basic minimum is to only NAT when there is a potential of
 	 * overlapping tuples, e.g. applications in hostns reusing
@@ -1176,41 +1156,60 @@ static __always_inline bool snat_v4_needed(struct __ctx_buff *ctx, __be32 *addr,
 #endif
 
 	ep = __lookup_ip4_endpoint(ip4->saddr);
-	if (ep && !(ep->flags & ENDPOINT_F_HOST)) {
-		struct remote_endpoint_info *info;
+	if (ep)
 		*from_endpoint = true;
+	/* If this is a localhost endpoint, no SNAT is needed. */
+	if (ep && (ep->flags & ENDPOINT_F_HOST))
+		return false;
 
-		info = ipcache_lookup4(&IPCACHE_MAP, ip4->daddr,
-				       V4_CACHE_KEY_LEN);
-		if (info) {
+	info = ipcache_lookup4(&IPCACHE_MAP, ip4->daddr, V4_CACHE_KEY_LEN);
+	if (info) {
 #ifdef ENABLE_IP_MASQ_AGENT
-			/* Do not SNAT if dst belongs to any ip-masq-agent
-			 * subnet.
-			 */
-			struct lpm_v4_key pfx;
+		/* Do not SNAT if dst belongs to any ip-masq-agent
+		 * subnet.
+		 */
+		struct lpm_v4_key pfx;
 
-			pfx.lpm.prefixlen = 32;
-			memcpy(pfx.lpm.data, &ip4->daddr, sizeof(pfx.addr));
-			if (map_lookup_elem(&IP_MASQ_AGENT_IPV4, &pfx))
-				return false;
+		pfx.lpm.prefixlen = 32;
+		memcpy(pfx.lpm.data, &ip4->daddr, sizeof(pfx.addr));
+		if (map_lookup_elem(&IP_MASQ_AGENT_IPV4, &pfx))
+			return false;
 #endif
 #ifndef TUNNEL_MODE
-			/* In the tunnel mode, a packet from a local ep
-			 * to a remote node is not encap'd, and is sent
-			 * via a native dev. Therefore, such packet has
-			 * to be MASQ'd. Otherwise, it might be dropped
-			 * either by underlying network (e.g. AWS drops
-			 * packets by default from unknown subnets) or
-			 * by the remote node if its native dev's
-			 * rp_filter=1.
-			 */
-			if (info->sec_label == REMOTE_NODE_ID)
-				return false;
+		/* In the tunnel mode, a packet from a local ep
+		 * to a remote node is not encap'd, and is sent
+		 * via a native dev. Therefore, such packet has
+		 * to be MASQ'd. Otherwise, it might be dropped
+		 * either by underlying network (e.g. AWS drops
+		 * packets by default from unknown subnets) or
+		 * by the remote node if its native dev's
+		 * rp_filter=1.
+		 */
+		if (info->sec_label == REMOTE_NODE_ID)
+			return false;
 #endif
+#if defined(ENABLE_EGRESS_GATEWAY)
+		/* We want to exclude internal cluster traffic from the matching
+		 * the egress gateway NAT policy.
+		 */
+		if (info->sec_label == WORLD_ID) {
+			struct egress_info *einfo;
 
-			tuple.nexthdr = ip4->protocol;
-			tuple.daddr = ip4->daddr;
-			tuple.saddr = ip4->saddr;
+			einfo = lookup_ip4_egress_endpoint(ip4->saddr, ip4->daddr);
+			if (einfo) {
+				*addr = einfo->egress_ip;
+				*from_endpoint = true;
+				return true;
+			}
+		}
+#endif
+		if (ep) {
+			bool is_reply = false;
+			struct ipv4_ct_tuple tuple = {
+				.nexthdr = ip4->protocol,
+				.daddr = ip4->daddr,
+				.saddr = ip4->saddr
+			};
 
 			/* The packet is a reply, which means that outside
 			 * has initiated the connection, so no need to SNAT
