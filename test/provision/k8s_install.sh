@@ -213,6 +213,51 @@ apiServer:
 EOF
 )
 
+# V1BETA3 configuration is enabled with DualStack feature gate by default.
+# IPv6 only clusters can still be opted by setting IPv6 variable to 1.
+# It also sets the cgroup-driver to "cgroupfs", away from "systemd",
+# so that docker does not have to be reconfigured and restarted.
+KUBEADM_CONFIG_V1BETA3=$(cat <<-EOF
+apiVersion: kubeadm.k8s.io/v1beta2
+kind: InitConfiguration
+localAPIEndpoint:
+  advertiseAddress: "{{ .KUBEADM_ADDR }}"
+  bindPort: 6443
+bootstrapTokens:
+- groups:
+  - system:bootstrappers:kubeadm:default-node-token
+  token: {{ .TOKEN }}
+  ttl: 24h0m0s
+  usages:
+  - signing
+  - authentication
+nodeRegistration:
+  criSocket: "{{ .KUBEADM_CRI_SOCKET }}"
+---
+apiVersion: kubeadm.k8s.io/v1beta2
+kind: ClusterConfiguration
+kubernetesVersion: "v{{ .K8S_FULL_VERSION }}"
+featureGates:
+  IPv6DualStack: {{ .IPV6_DUAL_STACK_FEATURE_GATE }}
+networking:
+  dnsDomain: cluster.local
+  podSubnet: "{{ .KUBEADM_V1BETA2_POD_CIDR }}"
+  serviceSubnet: "{{ .KUBEADM_V1BETA2_SVC_CIDR }}"
+controlPlaneEndpoint: "k8s1:6443"
+controllerManager:
+  extraArgs:
+    "node-cidr-mask-size-ipv6": "120"
+    "feature-gates": "{{ .CONTROLLER_FEATURE_GATES }},IPv6DualStack={{ .IPV6_DUAL_STACK_FEATURE_GATE }}"
+apiServer:
+  extraArgs:
+    "feature-gates": "{{ .API_SERVER_FEATURE_GATES }},IPv6DualStack={{ .IPV6_DUAL_STACK_FEATURE_GATE }}"
+---
+kind: KubeletConfiguration
+apiVersion: kubelet.config.k8s.io/v1beta1
+cgroupDriver: cgroupfs
+EOF
+)
+
 # CRIO bridge disabled.
 if [[ -f  "/etc/cni/net.d/100-crio-bridge.conf" ]]; then
     echo "Disabling crio CNI bridge"
@@ -309,9 +354,17 @@ case $K8S_VERSION in
         KUBEADM_OPTIONS="--ignore-preflight-errors=cri,swap"
         KUBEADM_WORKER_OPTIONS="--discovery-token-unsafe-skip-ca-verification --ignore-preflight-errors=cri,SystemVerification,swap"
         sudo ln -sf $COREDNS_DEPLOYMENT $DNS_DEPLOYMENT
-        KUBEADM_CONFIG="${KUBEADM_CONFIG_V1BETA2}"
+        KUBEADM_CONFIG="${KUBEADM_CONFIG_V1BETA3}"
         CONTROLLER_FEATURE_GATES="EndpointSlice=true"
         API_SERVER_FEATURE_GATES="EndpointSlice=true"
+        # kubeadm 1.22 changes the kubelet cgroupDriver from "cgroupfs" to "systemd"
+        # we need to change docker to match
+#         cat <<EOF > /etc/docker/daemon.json
+# {       
+#   "exec-opts": ["native.cgroupdriver=systemd"]
+# }
+# EOF
+# systemctl daemon-reload && systemctl restart docker
         ;;
 esac
 
